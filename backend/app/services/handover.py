@@ -24,15 +24,18 @@ def _now() -> str:
 
 
 def _escrow_blocker(conn, batch_id: int) -> dict | None:
-    """返回占用该批次的托管记录（含交班单号），无则 None。"""
+    """返回占用该批次的托管记录（含交班单号），无则 None。
+
+    只要批次在托管集合里就视为占用，不依赖交班单状态，避免残留行漏拦。
+    """
     return conn.execute(
         """
-        SELECT eb.handover_id
+        SELECT eb.handover_id, h.status AS handover_status
         FROM escrow_batches eb
         JOIN handovers h ON h.id = eb.handover_id
-        WHERE eb.batch_id = ? AND h.status = ?
+        WHERE eb.batch_id = ?
         """,
-        (batch_id, H_ACTIVE),
+        (batch_id,),
     ).fetchone()
 
 
@@ -43,6 +46,45 @@ def _require_not_escrow(conn, batch_id: int, action: str) -> None:
             409,
             f"批次#{batch_id} 处于托管中，禁止{action}（托管交班单#{blocker['handover_id']}）",
         )
+    b = conn.execute("SELECT status FROM batches WHERE id = ?", (batch_id,)).fetchone()
+    if b and b["status"] == ST_ESCROW:
+        # 托管行缺失但状态机仍是托管态：同样视为托管占用，按清单反查交班单号
+        owner = conn.execute(
+            """
+            SELECT hi.handover_id FROM handover_items hi
+            JOIN handovers h ON h.id = hi.handover_id
+            WHERE hi.batch_id = ? AND h.status = ?
+            ORDER BY h.id DESC LIMIT 1
+            """,
+            (batch_id, H_ACTIVE),
+        ).fetchone()
+        hid = owner["handover_id"] if owner else "?"
+        raise HTTPException(
+            409,
+            f"批次#{batch_id} 处于托管中，禁止{action}（托管交班单#{hid}）",
+        )
+
+
+def _inflight_count(conn, shift_id: int | None = None) -> int:
+    """在途口径：仅状态机「在途」且不在托管集合中的批次；两侧在途均不含托管。"""
+    where_shift = "AND b.owner_shift_id = ?" if shift_id is not None else ""
+    params: tuple = (shift_id,) if shift_id is not None else ()
+    return conn.execute(
+        f"""
+        SELECT COUNT(*) AS c FROM batches b
+        WHERE b.status = ?
+          AND NOT EXISTS (SELECT 1 FROM escrow_batches eb WHERE eb.batch_id = b.id)
+          {where_shift}
+        """,
+        (ST_INFLIGHT, *params),
+    ).fetchone()["c"]
+
+
+def _escrow_count(conn, handover_id: int) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) AS c FROM escrow_batches WHERE handover_id = ?",
+        (handover_id,),
+    ).fetchone()["c"]
 
 
 # ---------------- 查询 ----------------
@@ -132,9 +174,11 @@ def get_handover(handover_id: int) -> dict:
             raise HTTPException(404, "交班单不存在")
         items = conn.execute(
             """
-            SELECT b.*, eb.escrowed_at, eb.handover_id AS escrow_handover_id
+            SELECT b.*, s.name AS owner_shift_name,
+                   eb.escrowed_at, eb.handover_id AS escrow_handover_id
             FROM handover_items hi
             JOIN batches b ON b.id = hi.batch_id
+            LEFT JOIN shifts s ON s.id = b.owner_shift_id
             LEFT JOIN escrow_batches eb ON eb.batch_id = b.id AND eb.handover_id = hi.handover_id
             WHERE hi.handover_id = ?
             ORDER BY b.id
@@ -143,16 +187,91 @@ def get_handover(handover_id: int) -> dict:
         ).fetchall()
         out = dict(h)
         out["items"] = rows_to_dicts(items)
+        out["托管水位"] = _watermark_public(conn, handover_id)
         return out
+
+
+def _watermark_row(conn, handover_id: int) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM escrow_watermarks WHERE handover_id = ?", (handover_id,)
+    ).fetchone()
+    if not row:
+        return None
+    wm = dict(row)
+    wm["batch_ids"] = json.loads(wm.pop("batch_ids_json"))
+    wm["consistent"] = bool(wm["consistent"])
+    # 水位派生字段：托管集合恒等于发起清单，两侧在途均不含托管批次
+    wm["两侧在途均不含托管"] = (
+        wm["from_after_start_count"] == wm["from_before_count"] - wm["escrow_count"]
+        and wm["to_after_start_count"] == wm["to_before_count"]
+    )
+    return wm
+
+
+def get_escrow_watermark(handover_id: int, conn=None) -> dict:
+    """按交班单 id 读取持久化托管水位证明（只读）。"""
+    if conn is None:
+        with connect() as own:
+            return get_escrow_watermark(handover_id, conn=own)
+    h = conn.execute(
+        "SELECT id, status FROM handovers WHERE id = ?", (handover_id,)
+    ).fetchone()
+    if not h:
+        raise HTTPException(404, "交班单不存在")
+    wm = _watermark_public(conn, handover_id, required=True)
+    assert wm is not None
+    return wm
+
+
+def _watermark_public(conn, handover_id: int, required: bool = False) -> dict | None:
+    """把落库的托管水位证明整理成对外只读结构；数字均来自同一行同一事务。"""
+    wm = _watermark_row(conn, handover_id)
+    if wm is None:
+        if required:
+            raise HTTPException(404, "该交班单无托管水位证明")
+        return None
+    h = conn.execute(
+        "SELECT status FROM handovers WHERE id = ?", (handover_id,)
+    ).fetchone()
+    wm["handover_status"] = h["status"] if h else None
+    wm["托管当前"] = _escrow_snapshot(conn, handover_id)
+    wm["在途水位"] = {
+        "发起前": {"交班方": wm["from_before_count"], "接班方": wm["to_before_count"]},
+        "发起后": {"交班方": wm["from_after_start_count"], "接班方": wm["to_after_start_count"]},
+        "出口后": (
+            {"交班方": wm["from_after_exit_count"], "接班方": wm["to_after_exit_count"]}
+            if wm["from_after_exit_count"] is not None
+            else None
+        ),
+    }
+    wm["托管集合"] = {
+        "批次数": wm["escrow_count"],
+        "批次": wm["batch_ids"],
+        "出口后残留": wm["escrow_after_exit_count"],
+    }
+    return wm
+
+
+def _escrow_snapshot(conn, handover_id: int) -> list[dict]:
+    rows = conn.execute(
+        """
+        SELECT eb.batch_id, b.biz_key, b.title, b.status AS batch_status,
+               b.owner_shift_id, s.name AS owner_shift_name, eb.escrowed_at
+        FROM escrow_batches eb
+        JOIN batches b ON b.id = eb.batch_id
+        LEFT JOIN shifts s ON s.id = b.owner_shift_id
+        WHERE eb.handover_id = ?
+        ORDER BY eb.batch_id
+        """,
+        (handover_id,),
+    ).fetchall()
+    return rows_to_dicts(rows)
 
 
 def dashboard() -> dict:
     with connect() as conn:
         shifts = rows_to_dicts(conn.execute("SELECT * FROM shifts ORDER BY id").fetchall())
-        inflight = conn.execute(
-            "SELECT COUNT(*) AS c FROM batches WHERE status IN (?, ?)",
-            (ST_INFLIGHT, ST_ESCROW),
-        ).fetchone()["c"]
+        inflight = _inflight_count(conn)
         escrow = conn.execute("SELECT COUNT(*) AS c FROM escrow_batches").fetchone()["c"]
         active = conn.execute(
             "SELECT COUNT(*) AS c FROM handovers WHERE status = ?", (H_ACTIVE,)
@@ -236,7 +355,12 @@ def start_handover(from_shift_id: int, to_shift_id: int) -> dict:
             raise HTTPException(409, f"已有进行中的交班单#{active['id']}，禁止并行交班")
         # 只选取交班方名下的在途批次；托管中的批次不在任何一方在途，天然不会被再次选入
         batches = conn.execute(
-            "SELECT id FROM batches WHERE owner_shift_id = ? AND status = ? ORDER BY id",
+            """
+            SELECT b.id FROM batches b
+            WHERE b.owner_shift_id = ? AND b.status = ?
+              AND NOT EXISTS (SELECT 1 FROM escrow_batches eb WHERE eb.batch_id = b.id)
+            ORDER BY b.id
+            """,
             (from_shift_id, ST_INFLIGHT),
         ).fetchall()
         if not batches:
@@ -251,10 +375,7 @@ def start_handover(from_shift_id: int, to_shift_id: int) -> dict:
                 )
 
         from_before = len(batches)
-        to_before = conn.execute(
-            "SELECT COUNT(*) AS c FROM batches WHERE owner_shift_id = ? AND status = ?",
-            (to_shift_id, ST_INFLIGHT),
-        ).fetchone()["c"]
+        to_before = _inflight_count(conn, to_shift_id)
         now = _now()
         cur = conn.execute(
             """
@@ -269,7 +390,8 @@ def start_handover(from_shift_id: int, to_shift_id: int) -> dict:
                 "INSERT INTO handover_items(handover_id, batch_id) VALUES (?, ?)",
                 (hid, b["id"]),
             )
-            # 进入托管：独立托管表挂交班单 id + 批次状态机切到托管态
+            # 进入托管：独立托管表挂交班单 id + 批次状态机切到托管态；
+            # 归属保持交班方不变，托管期间不直接改到接班方（过户只发生在完成出口）。
             conn.execute(
                 """
                 INSERT INTO escrow_batches(handover_id, batch_id, from_shift_id, escrowed_at)
@@ -278,25 +400,17 @@ def start_handover(from_shift_id: int, to_shift_id: int) -> dict:
                 (hid, b["id"], from_shift_id, now),
             )
             changed = conn.execute(
-                "UPDATE batches SET status = ?, owner_shift_id = ? WHERE id = ? AND status = ?",
-                (ST_ESCROW, to_shift_id, b["id"], ST_INFLIGHT),
+                "UPDATE batches SET status = ? WHERE id = ? AND status = ?",
+                (ST_ESCROW, b["id"], ST_INFLIGHT),
             ).rowcount
             if changed != 1:
                 # 整单回滚：禁止部分进入托管
                 raise HTTPException(500, f"批次#{b['id']} 进入托管失败，整单回滚")
 
         # 发起时点对账快照：在途减少、托管承接、两侧在途均不含清单批次
-        from_after = conn.execute(
-            "SELECT COUNT(*) AS c FROM batches WHERE owner_shift_id = ? AND status = ?",
-            (from_shift_id, ST_INFLIGHT),
-        ).fetchone()["c"]
-        to_after = conn.execute(
-            "SELECT COUNT(*) AS c FROM batches WHERE owner_shift_id = ? AND status = ?",
-            (to_shift_id, ST_INFLIGHT),
-        ).fetchone()["c"]
-        escrow_n = conn.execute(
-            "SELECT COUNT(*) AS c FROM escrow_batches WHERE handover_id = ?", (hid,)
-        ).fetchone()["c"]
+        from_after = _inflight_count(conn, from_shift_id)
+        to_after = _inflight_count(conn, to_shift_id)
+        escrow_n = _escrow_count(conn, hid)
         start_consistent = (
             escrow_n == from_before
             and from_after == 0
@@ -326,6 +440,24 @@ def start_handover(from_shift_id: int, to_shift_id: int) -> dict:
                 hid, "发起", from_before, escrow_n,
                 from_after, to_after, 1 if start_consistent else 0,
                 json.dumps(detail, ensure_ascii=False), now,
+            ),
+        )
+        # 持久化托管水位证明：发起时点先落库，出口时补齐出口数字（唯一来源）。
+        conn.execute(
+            """
+            INSERT INTO escrow_watermarks(
+              handover_id, from_shift_id, to_shift_id,
+              from_before_count, to_before_count,
+              from_after_start_count, to_after_start_count,
+              escrow_count, batch_ids_json, consistent, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                hid, from_shift_id, to_shift_id,
+                from_before, to_before,
+                from_after, to_after,
+                escrow_n, json.dumps([b["id"] for b in batches]), 1 if start_consistent else 0,
+                now,
             ),
         )
 
@@ -411,17 +543,9 @@ def _exit_handover(conn, handover_id: int, exit_status: str, reason: str) -> dic
         raise HTTPException(500, "托管解除行数不符，整单回滚")
 
     # 出口后同源核对：托管清零、清单批次全部回到在途且归属正确
-    left_escrow = conn.execute(
-        "SELECT COUNT(*) AS c FROM escrow_batches WHERE handover_id = ?", (handover_id,)
-    ).fetchone()["c"]
-    from_after = conn.execute(
-        "SELECT COUNT(*) AS c FROM batches WHERE owner_shift_id = ? AND status = ?",
-        (from_sid, ST_INFLIGHT),
-    ).fetchone()["c"]
-    to_after = conn.execute(
-        "SELECT COUNT(*) AS c FROM batches WHERE owner_shift_id = ? AND status = ?",
-        (to_sid, ST_INFLIGHT),
-    ).fetchone()["c"]
+    left_escrow = _escrow_count(conn, handover_id)
+    from_after = _inflight_count(conn, from_sid)
+    to_after = _inflight_count(conn, to_sid)
     if exit_status == H_DONE:
         consistent = left_escrow == 0 and to_after >= n and from_after >= 0
         # 更严格：清单批次必须全部在接班方名下在途
@@ -480,6 +604,24 @@ def _exit_handover(conn, handover_id: int, exit_status: str, reason: str) -> dic
             handover_id, exit_cn, n, n,
             from_after, to_after, 1 if consistent else 0,
             json.dumps(detail, ensure_ascii=False), now,
+        ),
+    )
+    # 补齐托管水位证明的出口段；与交接单状态同一事务写入，数字与上面报告同源。
+    wm = conn.execute(
+        "SELECT handover_id FROM escrow_watermarks WHERE handover_id = ?", (handover_id,)
+    ).fetchone()
+    if not wm:
+        raise HTTPException(500, f"交班单#{handover_id} 缺少托管水位证明，整单回滚")
+    conn.execute(
+        """
+        UPDATE escrow_watermarks
+        SET exit_status = ?, from_after_exit_count = ?, to_after_exit_count = ?,
+            escrow_after_exit_count = ?, consistent = ?, finished_at = ?
+        WHERE handover_id = ?
+        """,
+        (
+            exit_status, from_after, to_after,
+            left_escrow, 1 if consistent else 0, now, handover_id,
         ),
     )
     if not consistent:

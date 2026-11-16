@@ -1,23 +1,27 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { getJson, postJson } from '../api'
 
 const shifts = ref([])
 const fromId = ref(1)
 const toId = ref(2)
 const current = ref(null)
+const detail = ref(null)
 const escrowRows = ref([])
 const msg = ref('')
 const ok = ref(false)
 
+const watermark = computed(() => detail.value?.['托管水位'] || null)
+
 async function refresh() {
   shifts.value = await getJson('/api/shifts')
   const logs = await getJson('/api/handovers')
-  current.value = logs.find((h) => h.status === '进行中') || null
   escrowRows.value = await getJson('/api/handovers/escrow')
-  if (current.value) {
-    current.value = await getJson(`/api/handovers/${current.value.id}`)
-  }
+  const active = logs.find((h) => h.status === '进行中') || null
+  current.value = active ? await getJson(`/api/handovers/${active.id}`) : null
+  // 进行中的单优先，其次最近一单：托管清单与水位证明与后端同源
+  const target = current.value || (logs[0] ? await getJson(`/api/handovers/${logs[0].id}`) : null)
+  detail.value = target
 }
 
 onMounted(async () => {
@@ -101,7 +105,7 @@ async function exitVia(path, successText, failText) {
         托管中 {{ current.escrow_count }} 批
       </p>
       <table>
-        <thead><tr><th>业务键</th><th>标题</th><th>批次状态</th><th>托管于</th><th>进入托管时间</th></tr></thead>
+        <thead><tr><th>业务键</th><th>标题</th><th>批次状态</th><th>归属班次</th><th>托管于</th><th>进入托管时间</th></tr></thead>
         <tbody>
           <tr v-for="b in current.items || []" :key="b.id">
             <td>{{ b.biz_key }}</td>
@@ -109,6 +113,7 @@ async function exitVia(path, successText, failText) {
             <td>
               <span class="tag" :class="{ escrow: b.status === '托管中' }">{{ b.status }}</span>
             </td>
+            <td>{{ b.owner_shift_name || '—' }}</td>
             <td>{{ b.escrow_handover_id ? `交班单 #${b.escrow_handover_id}` : '—' }}</td>
             <td>{{ b.escrowed_at || '—' }}</td>
           </tr>
@@ -117,6 +122,54 @@ async function exitVia(path, successText, failText) {
       <p class="lead" style="margin:12px 0 0">
         托管集合物理隔离于在途集合，独立入口 <code>GET /api/handovers/escrow?handover_id={{ current.id }}</code>
       </p>
+    </div>
+
+    <div class="panel" v-if="watermark">
+      <h2>托管清单与水位证明 · 交班单 #{{ watermark.handover_id }}</h2>
+      <p class="lead" style="margin-bottom:12px">
+        落库证明：<code>GET /api/handovers/{{ watermark.handover_id }}/escrow-watermark</code> ·
+        当前状态 {{ watermark.handover_status }} ·
+        <span class="tag" :class="{ on: watermark.consistent }">{{ watermark.consistent ? '一致' : '不一致' }}</span>
+        <span class="tag" :class="{ escrow: watermark['两侧在途均不含托管'] }">
+          两侧在途均不含托管：{{ watermark['两侧在途均不含托管'] ? '是' : '否' }}
+        </span>
+      </p>
+      <div class="stats">
+        <div class="stat"><div class="k">发起前 · 交班方在途</div><div class="v">{{ watermark['在途水位']['发起前']['交班方'] }}</div></div>
+        <div class="stat"><div class="k">发起前 · 接班方在途</div><div class="v">{{ watermark['在途水位']['发起前']['接班方'] }}</div></div>
+        <div class="stat escrow-stat"><div class="k">进入托管</div><div class="v">{{ watermark['托管集合']['批次数'] }}</div></div>
+        <div class="stat"><div class="k">发起后 · 交班方在途</div><div class="v">{{ watermark['在途水位']['发起后']['交班方'] }}</div></div>
+        <div class="stat"><div class="k">发起后 · 接班方在途</div><div class="v">{{ watermark['在途水位']['发起后']['接班方'] }}</div></div>
+        <div class="stat" v-if="watermark['在途水位']['出口后']">
+          <div class="k">出口后 · 交班方在途</div>
+          <div class="v">{{ watermark['在途水位']['出口后']['交班方'] }}</div>
+        </div>
+        <div class="stat" v-if="watermark['在途水位']['出口后']">
+          <div class="k">出口后 · 接班方在途</div>
+          <div class="v">{{ watermark['在途水位']['出口后']['接班方'] }}</div>
+        </div>
+        <div class="stat" v-if="watermark['托管集合']['出口后残留'] !== null">
+          <div class="k">出口后托管残留</div>
+          <div class="v">{{ watermark['托管集合']['出口后残留'] }}</div>
+        </div>
+      </div>
+      <h3 style="font-size:14px;margin:4px 0 10px">托管清单（{{ watermark['托管当前'].length }} 批在托管）</h3>
+      <table>
+        <thead><tr><th>批次</th><th>业务键</th><th>标题</th><th>批次状态</th><th>归属班次</th><th>进入托管时间</th></tr></thead>
+        <tbody>
+          <tr v-for="e in watermark['托管当前']" :key="e.batch_id">
+            <td>#{{ e.batch_id }}</td>
+            <td>{{ e.biz_key }}</td>
+            <td>{{ e.title }}</td>
+            <td><span class="tag escrow">{{ e.batch_status }}</span></td>
+            <td>{{ e.owner_shift_name || '—' }}</td>
+            <td>{{ e.escrowed_at }}</td>
+          </tr>
+          <tr v-if="!watermark['托管当前'].length">
+            <td colspan="6" class="muted-cell">已全部出托管，托管集合为空（出口后残留：{{ watermark['托管集合']['出口后残留'] ?? '—' }}）</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
 
     <div class="panel" v-else-if="escrowRows.length">

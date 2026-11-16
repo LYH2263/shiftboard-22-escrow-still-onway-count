@@ -35,6 +35,12 @@ def get_one(handover_id: int):
     return svc.get_handover(handover_id)
 
 
+@router.get("/{handover_id}/escrow-watermark")
+def get_escrow_watermark(handover_id: int):
+    """只读：按交班单 id 查持久化托管水位证明（发起前/后两侧在途、托管集合、出口后两侧在途）。"""
+    return svc.get_escrow_watermark(handover_id)
+
+
 @router.post("/start")
 def start(body: StartBody):
     return svc.start_handover(body.from_shift_id, body.to_shift_id)
